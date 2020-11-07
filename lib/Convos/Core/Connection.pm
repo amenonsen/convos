@@ -2,13 +2,15 @@ package Convos::Core::Connection;
 use Mojo::Base 'Mojo::EventEmitter';
 
 use Convos::Core::Conversation;
-use Convos::Util qw(DEBUG has_many);
+use Convos::Util qw(DEBUG generate_cert_p has_many);
 use Mojo::JSON qw(false true);
 use Mojo::Loader 'load_class';
 use Mojo::Promise;
 use Mojo::URL;
 use Mojo::Util qw(term_escape url_escape);
 use Unicode::UTF8;
+
+use constant GENERATE_CERT => $ENV{CONVOS_GENERATE_CERT} // '1';
 
 $IO::Socket::SSL::DEBUG = $ENV{CONVOS_TLS_DEBUG} if $ENV{CONVOS_TLS_DEBUG};
 
@@ -40,26 +42,31 @@ sub url {
 
 sub user { shift->{user} }
 
-sub connect {
+sub connect_p {
   my $self = shift;
+  my $lock = $self->{stream_id} || $self->{connecting};
 
   # Reconnect
   return $self->disconnect_p->then(
     sub { $self->user->core->connect($self, 'Reconnect on connection change.') })
-    if $self->{stream_id} and ($self->{host_port} || '') ne $self->url->host_port;
+    if $lock and ($self->{host_port} || '') ne $self->url->host_port;
 
   # Already connected/connecting
-  return if $self->{stream_id};
+  return if $lock;
 
-  delete $self->{disconnecting};
+  $self->{connecting} = delete $self->{disconnecting} || 1;
   $self->emit(state => frozen => $_->frozen('Not connected.')->TO_JSON)
     for grep { !$_->frozen } @{$self->conversations};
 
   # Connect
   Scalar::Util::weaken($self);
   $self->_debug('Connecting...') if DEBUG;
-  $self->{stream_id} = Mojo::IOLoop->client($self->_connect_args, sub { $self->_stream(@_) });
-  $self->{host_port} = $self->url->host_port;    # must be done after _connect_args() is called
+  return $self->_connect_args_p->then(sub {
+    my $connect_args = shift;
+    $self->_debug('connect = %s', Mojo::JSON::encode_json($connect_args)) if DEBUG;
+    $self->{stream_id} = Mojo::IOLoop->client($connect_args, sub { $self->_stream(@_) });
+    $self->{host_port} = $self->url->host_port;
+  });
 }
 
 has_many conversations => 'Convos::Core::Conversation' => sub {
@@ -143,7 +150,7 @@ sub state {
 
 sub uri { Mojo::Path->new(sprintf '%s/%s/connection.json', $_[0]->user->email, $_[0]->id) }
 
-sub _connect_args {
+sub _connect_args_p {
   my $self   = shift;
   my $url    = $self->url;
   my $params = $url->query;
@@ -154,18 +161,31 @@ sub _connect_args {
   $args{port}          = $url->port;
   $args{timeout}       = 20;
 
-  $params->param(tls => 1) unless defined $params->param('tls');
-  if ($params->param('tls')) {
-    $args{tls}        = 1;
-    $args{tls_ca}     = $ENV{CONVOS_TLS_CA} if $ENV{CONVOS_TLS_CA};
-    $args{tls_cert}   = $ENV{CONVOS_TLS_CERT} if $ENV{CONVOS_TLS_CERT};
-    $args{tls_key}    = $ENV{CONVOS_TLS_KEY} if $ENV{CONVOS_TLS_KEY};
-    $args{tls_verify} = 0x00 unless $params->param('tls_verify');
+  $params->param(tls => 1)              unless defined $params->param('tls');
+  return Mojo::Promise->resolve(\%args) unless $params->param('tls');
+
+  $args{tls}        = 1;
+  $args{tls_ca}     = $ENV{CONVOS_TLS_CA} if $ENV{CONVOS_TLS_CA};
+  $args{tls_verify} = 0x00 unless $params->param('tls_verify');
+  return Mojo::Promise->resolve(\%args) unless GENERATE_CERT;
+
+  my $cert_dir = $self->user->core->home->child($self->user->email, $self->id);
+  my $cert     = $cert_dir->child(sprintf '%s.cert', $self->id);
+  my $key      = $cert_dir->child(sprintf '%s.key', $self->id);
+
+  if (-r $cert and -r $key) {
+    @args{qw(tls_cert tls_key)} = map { $_->to_string } ($cert, $key);
+    return Mojo::Promise->resolve(\%args);
   }
 
-  $self->_debug('connect = %s', Mojo::JSON::encode_json(\%args)) if DEBUG;
-
-  return \%args;
+  $cert->dirname->make_path unless -d $cert->dirname;
+  return generate_cert_p({cert => $cert, key => $key, email => $self->user->email})->then(sub {
+    @args{qw(tls_cert tls_key)} = map { $_->to_string } ($cert, $key);
+    return \%args;
+  })->catch(sub {
+    warn "Failed to generate cert: $_[0]";
+    return \%args;
+  });
 }
 
 sub _debug {
@@ -216,6 +236,7 @@ sub _set_url {
 
 sub _stream {
   my ($self, $loop, $err, $stream) = @_;
+  delete $self->{connecting};
   return $self->_stream_on_error($stream, $err) if $err;
 
   $stream->timeout(0);
@@ -276,8 +297,9 @@ sub _stream_on_read {
 sub _stream_remove {
   my ($self, $p) = @_;
   my $stream = delete $self->{stream};
+  delete $self->{connecting};
   $stream->close if $stream;
-  $p->resolve({});
+  return $p->resolve({});
 }
 
 sub _write_p {
@@ -453,7 +475,7 @@ Holds a L<Convos::Core::User> object that owns this connection.
   $str = $conn->wanted_state;
 
 Used to change the state that the user I<want> the connection to be in. Note
-that it is also required to call L</connect> and L</disconnect> to actually
+that it is also required to call L</connect_p> and L</disconnect> to actually
 change the state.
 
 =head1 METHODS
@@ -461,9 +483,9 @@ change the state.
 L<Convos::Core::Connection> inherits all methods from L<Mojo::Base> and implements
 the following new ones.
 
-=head2 connect
+=head2 connect_p
 
-  $conn->connect;
+  $p = $conn->connect_p;
 
 Used to connect to L</url>. Meant to be overloaded in a subclass.
 
