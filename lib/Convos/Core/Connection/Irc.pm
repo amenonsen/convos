@@ -415,6 +415,49 @@ sub _irc_event_rpl_myinfo {
   $self->emit(state => me => $self->{myinfo});
 }
 
+sub _irc_event_authenticate {
+  my ($self, $msg) = @_;
+  $self->_irc_event_fallback($msg);
+
+  my $url = $self->url;
+  if ($msg->{raw_line} =~ m!AUTHENTICATE \+$!) {
+    my $mech = uc $url->query->param('sasl') || '';
+    my $auth = '*';
+
+    if ($mech eq 'EXTERNAL') {
+      $auth = $url->username || $self->user->email;
+    }
+    elsif ($mech eq 'PLAIN') {
+      my @auth = grep {length} $url->query->param('authname') || $url->username, $url->username,
+        $url->password;
+      $auth = b64_encode join "\0", @auth if @auth == 3;
+    }
+
+    $self->_write(sprintf "AUTHENTICATE $auth\r\n");
+  }
+}
+
+sub _irc_event_cap {
+  my ($self, $msg) = @_;
+  $self->_irc_event_fallback($msg);
+
+  if ($msg->{raw_line} =~ m!\s(?:LIST|LS)[^:]+:(.*)!) {
+    $self->{myinfo}{capabilities}{$_} = true for split /\s/, $1;
+    my @cap_req;
+    push @cap_req, 'sasl'
+      if $self->{myinfo}{capabilities}{sasl} and $self->url->query->param('sasl');
+    $self->_write(@cap_req ? sprintf "CAP REQ :%s\r\n", join ' ', @cap_req : "CAP END\r\n");
+  }
+  elsif ($msg->{raw_line} =~ m!\sACK\s:(.+)!) {
+    my $capabilities = $1;
+    my $mech         = uc $self->url->query->param('sasl') || '';
+    $self->_write("AUTHENTICATE $mech\r\n") if $mech and $capabilities =~ m!\bsasl\b!;
+  }
+  elsif ($msg->{raw_line} =~ m!\sNAC!) {
+    $self->_write("CAP END\r\n");
+  }
+}
+
 sub _irc_event_rpl_notopic {
   my ($self, $msg) = @_;
   $self->_irc_event_rpl_topic({%$msg, params => [$msg->{params}[0], $msg->{params}[0], '']});
@@ -656,6 +699,12 @@ sub _periodic_events {
       $self->_write("PING $self->{myinfo}{real_host}\r\n") if $self->{myinfo}{real_host};
     }
   );
+}
+
+sub _sasl_authenticate_start {
+  my $self = shift;
+
+  # CAP REQ :multi-prefix sasl
 }
 
 sub _send_clear_p {
@@ -1042,7 +1091,9 @@ sub _stream {
   my $nick = $self->nick;
   my $user = $url->username || $nick;
   my $mode = $url->query->param('mode') || 0;
-  $self->_write(sprintf "PASS %s\r\n", $url->password) if length $url->password;
+  $self->_write("CAP LS\r\n");
+  $self->_write(sprintf "PASS %s\r\n", $url->password)
+    if length $url->password and !$self->url->query->param('sasl');
   $self->_write("NICK $nick\r\n");
   $self->_write("USER $user $mode * :https://convos.chat/\r\n");
 }
