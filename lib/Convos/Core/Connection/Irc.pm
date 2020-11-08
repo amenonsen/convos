@@ -421,7 +421,7 @@ sub _irc_event_authenticate {
 
   my $url = $self->url;
   if ($msg->{raw_line} =~ m!AUTHENTICATE \+$!) {
-    my $mech = uc $url->query->param('sasl') || '';
+    my $mech = $self->_sasl_mechanism;
     my $auth = '*';
 
     if ($mech eq 'EXTERNAL') {
@@ -444,14 +444,12 @@ sub _irc_event_cap {
   if ($msg->{raw_line} =~ m!\s(?:LIST|LS)[^:]+:(.*)!) {
     $self->{myinfo}{capabilities}{$_} = true for split /\s/, $1;
     my @cap_req;
-    push @cap_req, 'sasl'
-      if $self->{myinfo}{capabilities}{sasl} and $self->url->query->param('sasl');
+    push @cap_req, 'sasl' if $self->{myinfo}{capabilities}{sasl} and $self->_sasl_mechanism;
     $self->_write(@cap_req ? sprintf "CAP REQ :%s\r\n", join ' ', @cap_req : "CAP END\r\n");
   }
   elsif ($msg->{raw_line} =~ m!\sACK\s:(.+)!) {
     my $capabilities = $1;
-    my $mech         = uc $self->url->query->param('sasl') || '';
-    $self->_write("AUTHENTICATE $mech\r\n") if $mech and $capabilities =~ m!\bsasl\b!;
+    $self->_write("AUTHENTICATE $mech\r\n") if $capabilities =~ m!\bsasl\b! and;
   }
   elsif ($msg->{raw_line} =~ m!\sNAC!) {
     $self->_write("CAP END\r\n");
@@ -645,6 +643,10 @@ sub _make_whois_response {
   return @$res{qw(nick user host name)} = @{$msg->{params}}[1, 2, 3, 5]
     if $msg->{command} eq 'rpl_whoisuser';
 
+  if ($msg->{command} eq '276') {
+    $res->{fingerprint} = $1 if $msg->{raw_line} =~ m!fingerprint\s(\S+)!;
+    $res->{secure}      = true;
+  }
   if ($msg->{command} eq 'rpl_whoischannels') {
     for (split /\s+/, $msg->{params}[2] || '') {
       my ($mode, $channel) = $self->_parse_mode($_);
@@ -701,10 +703,10 @@ sub _periodic_events {
   );
 }
 
-sub _sasl_authenticate_start {
+sub _sasl_mechanism {
   my $self = shift;
-
-  # CAP REQ :multi-prefix sasl
+  my $mech = uc $self->url->query->param('sasl') || '';
+  return $mech =~ m!^(EXTERNAL|PLAIN)$! ? $mech : '';
 }
 
 sub _send_clear_p {
@@ -1016,6 +1018,7 @@ sub _send_whois_p {
   return $self->_write_and_wait_p(
     "WHOIS $target",
     {away => false, channels => {}, name => '', nick => $target, server => '', user => ''},
+    276               => {1 => $target},
     err_nosuchnick    => {1 => $target},
     err_nosuchserver  => {1 => $target},
     rpl_away          => {1 => $target},
@@ -1093,7 +1096,7 @@ sub _stream {
   my $mode = $url->query->param('mode') || 0;
   $self->_write("CAP LS\r\n");
   $self->_write(sprintf "PASS %s\r\n", $url->password)
-    if length $url->password and !$self->url->query->param('sasl');
+    if length $url->password and !$self->_sasl_mechanism;
   $self->_write("NICK $nick\r\n");
   $self->_write("USER $user $mode * :https://convos.chat/\r\n");
 }
